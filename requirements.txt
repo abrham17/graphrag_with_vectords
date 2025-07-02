@@ -6,4 +6,5 @@ faiss-cpu
 python-dotenv
 PyPDF2
 nest_asyncio
-mistralai 
+mistralai
+langchain-google-genai 

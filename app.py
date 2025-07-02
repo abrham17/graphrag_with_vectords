@@ -15,33 +15,35 @@ import streamlit as st
 from PyPDF2 import PdfReader
 from mistralai import Mistral
 from langchain.embeddings.base import Embeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 # Load environment variables
 load_dotenv()
-URI = "neo4j+s://474fb344.databases.neo4j.io"
-AUTH = ("neo4j", "rXazbEHSDzO5Qq3FwQdlKGuN3uy1tYPx9BgvRcbi-o0")
+URI = "neo4j+s://474fb344.databases.neo4j.io"  # Update with your Neo4j URI
+AUTH = ("neo4j", "rXazbEHSDzO5Qq3FwQdlKGuN3uy1tYPx9BgvRcbi-o0")  # Update with your Neo4j credentials
 DATABASE = "neo4j"
-api_key = os.getenv("MISTRAL_API_KEY")
-if not api_key:
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not MISTRAL_API_KEY:
     raise ValueError("MISTRAL_API_KEY not found in environment variables")
 
-client = Mistral(api_key=api_key)
+client = Mistral(api_key=MISTRAL_API_KEY)
 llm = MistralAILLM(
     model_name="mistral-medium",
-    api_key=api_key,
+    api_key=MISTRAL_API_KEY,
     model_params={"max_tokens": 2000, "response_format": {"type": "json_object"}},
 )
 embedder = MistralAIEmbeddings()
 neo4j_driver = neo4j.GraphDatabase.driver(URI, auth=AUTH)
 
 # Knowledge Graph Construction
-async def create_knowledge_graph(file_path, schema=None):
+async def create_knowledge_graph(file_path):
     try:
         kg_builder = SimpleKGPipeline(
             llm=llm,
             driver=neo4j_driver,
             embedder=embedder,
-            neo4j_database=DATABASE
+            neo4j_database=DATABASE,
         )
         await kg_builder.run_async(file_path=str(file_path))
     except Exception as e:
@@ -113,9 +115,7 @@ def graph_retrieval(query, top_k=5):
 
 def combine_results(vector_results, graph_results):
     all_results = vector_results + graph_results
-    # Normalize scores (assuming vector scores are 0-1, graph scores need scaling if different)
     normalized_results = [(content, min(score, 1.0)) for content, score in all_results]
-    # Sort by score and deduplicate
     unique_results = []
     seen = set()
     for content, score in sorted(normalized_results, key=lambda x: x[1], reverse=True):
@@ -123,13 +123,12 @@ def combine_results(vector_results, graph_results):
         if content_str not in seen:
             unique_results.append((content_str, score))
             seen.add(content_str)
-    return unique_results[:5]  # Limit to top 5
+    return unique_results[:5]
 
 # Query Rewriting & Fusion
 def rewrite_query(query, num_variants=3):
     try:
         prompt = f"Generate {num_variants} precise variants of this query: {query}"
-        # Create a fresh coroutine each time
         response = run_async(llm.ainvoke(prompt))
         variants = response.split("\n") if isinstance(response, str) else [query]
         return [query] + variants[:num_variants]
@@ -148,9 +147,10 @@ def generate_answer(query, retrieved_info):
     Provide a detailed answer based on the information above. Include source citations (e.g., 'From text chunk' or 'From graph') and handle any conflicting information by noting discrepancies and providing the most likely answer based on evidence.
     """
     try:
-        # Create a fresh coroutine each time
-        response = run_async(llm.ainvoke(prompt))
-        return response
+        llm = ChatGoogleGenerativeAI(model="models/gemini-1.5-flash", google_api_key=GEMINI_API_KEY)
+        response = llm.invoke(prompt)
+        # Some LLMs return a .content attribute, some return a string
+        return response.content if hasattr(response, 'content') else response
     except Exception as e:
         st.error(f"Answer generation error: {str(e)}")
         return "Unable to generate answer due to an error."
@@ -159,7 +159,6 @@ def generate_answer(query, retrieved_info):
 def sidebar_pdf_upload():
     st.sidebar.header("Upload & Process PDF")
     uploaded_file = st.sidebar.file_uploader("Upload a PDF", type="pdf")
-    schema_input = st.sidebar.text_area("Define Schema (JSON, optional)", placeholder='e.g., {"nodes": ["Person", "Org"], "relationships": ["WORKS_FOR"]}')
     if uploaded_file and st.session_state.get("vector_store") is None:
         with st.spinner("Processing PDF..."):
             try:
@@ -175,11 +174,7 @@ def sidebar_pdf_upload():
                 
                 vector_store = create_vector_store(chunks, embeddings)
                 
-                schema = None
-                if schema_input.strip():
-                    schema = json.loads(schema_input)
-                
-                asyncio.run(create_knowledge_graph(file_path, schema))
+                asyncio.run(create_knowledge_graph(file_path))
                 
                 if embeddings and len(embeddings) > 0 and embeddings[0] is not None:
                     dimension = len(embeddings[0])
@@ -208,6 +203,7 @@ def sidebar_pdf_upload():
             except Exception as e:
                 st.error(f"Processing failed: {str(e)}")
 
+
 # Chat Interface
 def chat_interface():
     st.title("GraphRAG Q&A System")
@@ -221,37 +217,38 @@ def chat_interface():
             retrieved_info = []
             for query in query_variants:
                 vector_results = vector_retrieval(query, st.session_state.vector_store) if st.session_state.get("vector_store") else []
+                if vector_results:
+                    print("vector_results" ,True)
+                else:
+                    print("no vector result found")
+                print("-------------------------------------------------------------------------------------------------------------")
                 graph_results = graph_retrieval(query)
+                if graph_results:
+                    print("graph_results" ,True)
                 combined = combine_results(vector_results, graph_results)
                 retrieved_info.extend(combined)
             answer = generate_answer(user_input, retrieved_info)
             st.session_state.messages.append(("bot", answer))
-    for sender, message in st.session_state.get("messages", []):
+    for sender, message in reversed(st.session_state.get("messages", [])):
         st.markdown(f"**{'You' if sender == 'user' else 'Bot'}:** {message}")
+
+# Helper function to run async tasks
+def run_async(coro):
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            nest_asyncio.apply()
+            return loop.run_until_complete(coro)
+        else:
+            return loop.run_until_complete(coro)
 
 # Main App
 def main():
     st.set_page_config(page_title="GraphRAG Q&A", layout="centered")
     sidebar_pdf_upload()
     chat_interface()
-
-def run_async(coro):
-    try:
-        return asyncio.run(coro)
-    except RuntimeError as e:
-        # If there's already a running event loop, use it
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            # No event loop in this thread: create one
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        if loop.is_running():
-            import nest_asyncio
-            nest_asyncio.apply()
-            return loop.run_until_complete(coro)
-        else:
-            return loop.run_until_complete(coro)
 
 if __name__ == "__main__":
     main()
