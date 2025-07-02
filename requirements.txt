@@ -1,0 +1,9 @@
+streamlit
+neo4j
+langchain
+langchain-community
+faiss-cpu
+python-dotenv
+PyPDF2
+nest_asyncio
+mistralai 
